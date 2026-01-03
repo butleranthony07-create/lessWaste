@@ -3,158 +3,252 @@ import sys
 import os
 import re
 import hashlib
-from typing import List
-from typing import Optional
 
+CHUNK_SIZE = 65536
 PRINTER_PATH = "/tmp/printer"
 
-def read_file(path: str) -> str:
-    """Read the full content of a text file with UTF-8 encoding."""
+# ------------------------------------------------------------
+# STREAMING HELPERS
+# ------------------------------------------------------------
+
+def stream_detect_slicer_and_metadata(path):
+    """Streaming pass: detect slicer, detect _IFS_COLORS, extract metadata lines,
+       extract filament colors/types, feedrates, and capture first layer."""
+    slicer = ""
+    already = None
+    colors = []
+    types = []
+    feedrates = ""
+    version = "1.2.2"
+    filament_colour_line = ""
+    filament_type_line = ""
+    filament_max_vol_line = ""
+    change_filament_line = ""
+    metadata_lines = {}
+    first_layer_lines = []
+    in_first_layer = False
+    after_layer_count = 0
+    tools = set()
+    tool_regex = re.compile(r"\bT(\d+)\b")
+
+    metadata_keys = [
+        "; nozzle_temperature =",
+        "; hot_plate_temp =",
+        "; filament_colour =",
+        "; nozzle_diameter =",
+        "; filament_type =",
+        "; layer_height =",
+        "; estimated printing time",
+        "; filament_settings_id = ",
+        "; total filament length",
+        "; total filament weight",
+    ]
+
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+        for line in f:
+            # Detect slicer (first 20 lines only)
+            if not slicer:
+                if "BambuStudio" in line:
+                    slicer = "bambu"
+                elif "OrcaSlicer" in line:
+                    slicer = "orca"
 
-def detect_slicer(text: str) -> str:
-    """Detect which slicer generated the file based on header content."""
-    for line in text.splitlines()[:20]:
-        if "BambuStudio" in line:
-            return "bambu"
-        elif "OrcaSlicer" in line:
-            return "orca"
-    return ""
+            # Detect already processed
+            if already is None and line.startswith("; _IFS_COLORS"):
+                already = line.strip() + "\n"
 
-def already_post_processed(text: str) -> Optional[str]:
-    """Return the _IFS_COLORS line if the G-code was already post-processed."""
-    match = re.search(r"^;\s*_IFS_COLORS.*$", text, re.MULTILINE)
-    return match.group(0).lstrip("; ").rstrip() + "\n" if match else None
+            # Capture metadata lines
+            for key in metadata_keys:
+                if key in line and key not in metadata_lines:
+                    metadata_lines[key] = line.strip()
 
-def find_metadata_line(text: str, key: str) -> str:
-    """Extract the line value for a given metadata key."""
-    start = text.find(key)
-    if start == -1:
-        return ""
-    end = text.find("\n", start)
-    return text[start:end].strip()
+            # Capture filament colors/types
+            if line.startswith("; filament_colour ="):
+                filament_colour_line = line
+            if line.startswith("; filament_type ="):
+                filament_type_line = line
 
-def extract_first_layer(text: str) -> str:
-    """Return concatenated G-code for all first layers"""
-    layer_height = find_metadata_line(text, "; initial_layer_print_height").split("=")[-1].strip()
-    pattern = rf"\n;AFTER_LAYER_CHANGE\n;{re.escape(layer_height)}(.*?)\n;AFTER_LAYER_CHANGE"
-    first_layers = []
-    for layer in re.finditer(pattern, text, re.MULTILINE | re.DOTALL):
-        first_layers.append(layer.group(1).strip())
-    return "\n".join(first_layers)
+            # Capture feedrates
+            if line.startswith("; filament_max_volumetric_speed ="):
+                filament_max_vol_line = line
 
-def get_exclude_object_define(gcode: str) -> Optional[str]:
-    """bounding box first layer"""
-    lines = gcode.splitlines()
+            # Capture change_filament_gcode version
+            if "less_waste:" in line:
+                m = re.search(r"less_waste:\s*v([\d.]+)", line)
+                if m:
+                    version = m.group(1)
+
+            # First layer extraction using Orca markers
+            if line.startswith(";AFTER_LAYER_CHANGE"):
+                after_layer_count += 1
+                if after_layer_count == 1:
+                    in_first_layer = True
+                    continue
+                elif after_layer_count == 2:
+                    in_first_layer = False
+                    
+            for m in tool_regex.finditer(line):
+                tools.add(m.group(1))
+
+            if in_first_layer:
+                first_layer_lines.append(line)
+
+    # Parse colors/types
+    if filament_colour_line:
+        colors = [v.strip() for v in filament_colour_line.split("=", 1)[1].split(";") if v.strip()]
+    if filament_type_line:
+        types = [v.strip() for v in filament_type_line.split("=", 1)[1].split(";") if v.strip()]
+
+    # Parse feedrates
+    if filament_max_vol_line:
+        vals = filament_max_vol_line.split("=", 1)[1].strip().split(",")
+        feedrates = ",".join(str(round(float(v) / 4 * 3 * 60)) for v in vals)
+
+    # Build bambu metadata block
+    bambu_metadata = ""
+    if slicer == "bambu":
+        def get_val(key):
+            if key not in metadata_lines:
+                return ""
+            line = metadata_lines[key]
+            return line.split("=", 1)[1].split(",")[0].strip()
+
+        nozzle_temp = get_val("; nozzle_temperature =")
+        bed_temp = get_val("; hot_plate_temp =")
+        nozzle_diameter = metadata_lines.get("; nozzle_diameter =", "")
+        filament_colour = metadata_lines.get("; filament_colour =", "")
+        filament_type = metadata_lines.get("; filament_type =", "")
+        layer_height = metadata_lines.get("; layer_height =", "")
+        est_time = metadata_lines.get("; estimated printing time", "")
+        filament_id = metadata_lines.get("; filament_settings_id = ", "")
+
+        used_mm_line = metadata_lines.get("; total filament length", "")
+        filament_used_mm = ""
+        if used_mm_line:
+            filament_used_mm = f"; filament used [mm] = {used_mm_line.split(':')[1].strip()}"
+
+        used_g_line = metadata_lines.get("; total filament weight", "")
+        filament_used_g = ""
+        total_filament_used_g = ""
+        if used_g_line:
+            weights = used_g_line.split(':')[1].strip()
+            filament_used_g = f"; filament used [g] = {weights}"
+            total_filament_used_g = f"; total filament used [g] = {sum(float(x) for x in weights.split(','))}"
+
+        bambu_metadata = (
+            f"\n{filament_used_mm}\n"
+            f"{filament_used_g}\n"
+            f"{total_filament_used_g}\n"
+            f"{est_time}\n"
+            f"{filament_type}\n"
+            f"{filament_id}\n"
+            f"{layer_height}\n"
+            f"{nozzle_diameter}\n"
+            f"{filament_colour}\n"
+            f"; first_layer_bed_temperature = {bed_temp}\n"
+            f"; first_layer_temperature = {nozzle_temp}\n"
+        )
+
+    return (
+        slicer,
+        already,
+        colors,
+        types,
+        feedrates,
+        version,
+        "".join(first_layer_lines),
+        bambu_metadata,
+        sorted(tools)
+    )
+
+def get_exclude_object_define_streaming(first_layer_text):
+    """Compute bounding box from first layer G-code."""
     minx = miny = float("inf")
     maxx = maxy = float("-inf")
 
-    for line in lines:
+    for line in first_layer_text.splitlines():
         parts = line.split()
         if not parts:
             continue
-        cmd = parts[0]
-        if cmd.startswith(("G1", "G2", "G3")):
-            x = y = e = None
-            for p in parts[1:]:
-                if p.startswith("X"):
-                    x = float(p[1:])
-                elif p.startswith("Y"):
-                    y = float(p[1:])
-                elif p.startswith("E"):
-                    e = float(p[1:])
-            if e is None or e <= 0:
-                continue  # Ignore movements without extrusion
-            if x is not None:
-                minx = min(minx, x)
-                maxx = max(maxx, x)
-            if y is not None:
-                miny = min(miny, y)
-                maxy = max(maxy, y)
-    
+        if parts[0] not in ("G1", "G2", "G3"):
+            continue
 
-    if minx == float("inf") or miny == float("inf"):
+        x = y = e = None
+        for p in parts[1:]:
+            if p.startswith("X"):
+                x = float(p[1:])
+            elif p.startswith("Y"):
+                y = float(p[1:])
+            elif p.startswith("E"):
+                e = float(p[1:])
+
+        if e is None or e <= 0:
+            continue
+
+        if x is not None:
+            minx = min(minx, x)
+            maxx = max(maxx, x)
+        if y is not None:
+            miny = min(miny, y)
+            maxy = max(maxy, y)
+
+    if minx == float("inf"):
         return None
 
-    center_x = (minx + maxx) / 2
-    center_y = (miny + maxy) / 2
-    exclude_str = (
-        f"EXCLUDE_OBJECT_DEFINE NAME=First_Layer CENTER={center_x:.4f},{center_y:.4f} "
+    cx = (minx + maxx) / 2
+    cy = (miny + maxy) / 2
+
+    return (
+        f"EXCLUDE_OBJECT_DEFINE NAME=First_Layer CENTER={cx:.4f},{cy:.4f} "
         f"POLYGON=[[{minx:.6f},{miny:.6f}],"
         f"[{maxx:.6f},{miny:.6f}],"
         f"[{maxx:.6f},{maxy:.6f}],"
         f"[{minx:.6f},{maxy:.6f}]]"
     )
-    return exclude_str
 
-def parse_list_from_comment(text: str, key: str) -> List[str]:
-    """Parse a semicolon-separated list from a comment line."""
-    start = text.find(key)
-    if start == -1:
-        return []
-    end = text.find("\n", start)
-    return [v.strip() for v in text[start + len(key):end].split(";") if v.strip()]
+# ------------------------------------------------------------
+# STREAMING MD5 REWRITE
+# ------------------------------------------------------------
 
-def parse_feedrates(text: str) -> str:
-    """Extract and convert feedrates from filament_max_volumetric_speed."""
-    start = text.find("; filament_max_volumetric_speed =")
-    if start == -1:
-        return ""
-    end = text.find("\n", start)
-    values = (float(v) for v in text[start + len("; filament_max_volumetric_speed ="):end].split(","))
-    return ",".join(str(round(v / 4 * 3 * 60)) for v in values)
+def process_gcode_streaming_atomic(file_path, ifs_colors, bambu_metadata):
+    temp_path = file_path + ".tmp"
 
-def parse_change_filament_gcode_version(text: str) -> str:
-    """Extract version from change_filament_gcode"""
-    match = re.search(r";\s*less_waste:\s*v*([\d.]+)", text)
-    version = match.group(1) if match else '1.2.2'
-    return version
+    md5 = hashlib.md5()
+    header_line = "; " + ifs_colors + "\n"
+    md5.update(header_line.encode("utf-8"))
 
-def extract_bambu_metadata(text: str) -> str:
-    """Extract Bambu slicer-specific metadata and build the end G-code block."""
-    def get_line_value(key: str) -> str:
-        return find_metadata_line(text, key).split("=")[-1].split(",")[0].strip() if find_metadata_line(text, key) else ""
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            md5.update(chunk)
 
-    nozzle_temp = get_line_value("; nozzle_temperature =")
-    bed_temp = get_line_value("; hot_plate_temp =")
-    filament_colour = find_metadata_line(text, "; filament_colour =")
-    nozzle_diameter = find_metadata_line(text, "; nozzle_diameter =")
-    filament_type = find_metadata_line(text, "; filament_type =")
-    layer_height = find_metadata_line(text, "; layer_height =")
-    est_time = find_metadata_line(text, "; estimated printing time")
-    filament_id = find_metadata_line(text, "; filament_settings_id = ")
-    used_mm_line = find_metadata_line(text, "; total filament length")
-    filament_used_mm = f"; filament used [mm] = {used_mm_line.split(':')[1].strip()}" if used_mm_line else ""
-    used_g_line = find_metadata_line(text, "; total filament weight")
-    filament_used_g = ""
-    total_filament_used_g = ""
-    if used_g_line:
-        weights = used_g_line.split(':')[1].strip()
-        filament_used_g = f"; filament used [g] = {weights}"
-        total_filament_used_g = f"; total filament used [g] = {sum(float(x) for x in weights.split(','))}"
+    md5.update(bambu_metadata.encode("utf-8"))
+    md5_line = "; MD5:" + md5.hexdigest() + "\n"
 
-    return (
-        f"{filament_used_mm}\n"
-        f"{filament_used_g}\n"
-        f"{total_filament_used_g}\n"
-        f"{est_time}\n"
-        f"{filament_type}\n"
-        f"{filament_id}\n"
-        f"{layer_height}\n"
-        f"{nozzle_diameter}\n"
-        f"{filament_colour}\n"
-        f"; first_layer_bed_temperature = {bed_temp}\n"
-        f"; first_layer_temperature = {nozzle_temp}\n"
-    )
+    with open(temp_path, "wb") as out, open(file_path, "rb") as f:
+        out.write(md5_line.encode("utf-8"))
+        out.write(header_line.encode("utf-8"))
 
-def write_to_file(path: str, content: str):
-    """Write text content to file."""
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            out.write(chunk)
+
+        out.write(bambu_metadata.encode("utf-8"))
+
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(content)
-    except OSError as e:
-        print(f"Error when writing in {path}: {e}")
+        os.remove(file_path)
+    except OSError:
+        pass
+
+    os.rename(temp_path, file_path)
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
 
 def main():
     if len(sys.argv) < 2:
@@ -162,30 +256,28 @@ def main():
         sys.exit(1)
 
     file_path = sys.argv[1]
-    gcode = read_file(file_path)
-
-    # Check if file already contains _IFS_COLORS header
-    existing = already_post_processed(gcode)
-    if existing:
-        print("Already post-processed")
-        print(existing)
-        write_to_file(PRINTER_PATH, existing)
+    print("Parsing G-code...")
+    (
+        slicer,
+        already,
+        colors,
+        types,
+        feedrates,
+        version,
+        first_layer,
+        bambu_metadata,
+        tools
+    ) = stream_detect_slicer_and_metadata(file_path)
+    print("Complete")
+    if already:
+        print("Already post-processed" + "\n")
+        #print(already)
+        with open(PRINTER_PATH, "a", encoding="utf-8") as f:
+            f.write(already)
         sys.exit(0)
-    
-    slicer = detect_slicer(gcode)
-    from_slicer = any(k.startswith("SLIC3R_") for k in os.environ)
 
-    # Extract metadata
-    tools = sorted({m.group(1) for m in re.finditer(r"^\s*T(\d+)", gcode, re.MULTILINE)})
-    colors = parse_list_from_comment(gcode, "; filament_colour =")
-    types = parse_list_from_comment(gcode, "; filament_type =")
-    feedrates = parse_feedrates(gcode)
-    first_layer = extract_first_layer(gcode)
-    exclude = get_exclude_object_define(first_layer)
-    bambu_metadata = ("\n" + extract_bambu_metadata(gcode)) if slicer == "bambu" else ""
-    version = parse_change_filament_gcode_version(gcode)
+    exclude = get_exclude_object_define_streaming(first_layer)
 
-    # _IFS_COLORS header
     ifs_colors = (
         f'_IFS_COLORS START=1 '
         f'TYPES={",".join(types)} '
@@ -195,26 +287,15 @@ def main():
         f'VERSION={version} '
         f'EXCLUDE="{exclude}"'
     )
-    print(ifs_colors + "\n")
 
-    try:
-        lines = gcode.splitlines(keepends=True)
-        if lines and lines[0].startswith("; MD5:"):
-            lines.pop(0)
-            gcode = "".join(lines)
-        new_gcode_str = "; " + ifs_colors + "\n" + gcode + bambu_metadata
-        new_gcode_bytes = new_gcode_str.encode("utf-8")
-        md5_hash = hashlib.md5(new_gcode_bytes).hexdigest()
-        md5_line = b"; MD5:" + md5_hash.encode("ascii") + b"\n"
-        final_gcode = md5_line + new_gcode_bytes
-        with open(file_path, "wb") as f:
-            f.write(final_gcode)
-    except OSError as e:
-        print(f"Error when writing in {file_path}: {e}")
+    #print(ifs_colors + "\n")
+    print("Generating G-code MD5...")
+    process_gcode_streaming_atomic(file_path, ifs_colors, bambu_metadata)
+    print("Complete")
+    if not any(k.startswith("SLIC3R_") for k in os.environ):
+        with open(PRINTER_PATH, "a", encoding="utf-8") as f:
+            f.write(ifs_colors + "\n")
 
-    # Append to printer if not called from slicer
-    if not from_slicer:
-        write_to_file(PRINTER_PATH, ifs_colors + "\n")
 
 if __name__ == "__main__":
     main()
